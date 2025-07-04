@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">PdfViewer</string>
+    <string name="_loading">加载中...</string>
+</resources>
