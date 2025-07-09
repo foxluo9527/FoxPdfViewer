@@ -11,9 +11,12 @@ import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.util.AttributeSet
 import android.util.Size
+import android.view.Surface
 import android.view.View
 import android.widget.FrameLayout
+import android.widget.ImageView
 import androidx.annotation.OptIn
+import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -32,13 +35,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.opencv.android.Utils
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
+import org.opencv.core.Scalar
+import org.opencv.imgproc.Imgproc
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
-import androidx.core.view.isVisible
+import androidx.core.graphics.createBitmap
+import com.foxluo.pdf.ui.activity.base.BaseBindingActivity
+import com.foxluo.pdf.util.YuvToRgbConverter
+import kotlinx.coroutines.withContext
 
 // 闪光灯模式枚举
 enum class FlashMode { OFF, ON, AUTO, TORCH }
@@ -72,18 +82,26 @@ class CameraPreviewView @JvmOverloads constructor(
         }
     }
 
+    private val cropPreviewView by lazy {
+        ImageView(context).apply {
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+            visibility = GONE
+            tag = 0L
+        }
+    }
+
     // 相机相关变量
     private var cameraProvider: ProcessCameraProvider? = null
     private var preview: Preview? = null
     private var imageAnalyzer: ImageAnalysis? = null
-    private var cameraExecutor: ExecutorService? = null
+    private val cameraExecutor: ExecutorService by lazy {
+        Executors.newSingleThreadExecutor()
+    }
     private var lifecycleOwner: LifecycleOwner? = null
 
     // 配置参数
     private var _flashMode: FlashMode = FlashMode.OFF
     private var isFlashAvailable: Boolean = false
-    private var currentResolution: Size? = null
-    private var _supportedResolutions: MutableList<Size> = mutableListOf()
 
     // 文档检测相关
     private var documentDetectedCallback: (() -> Unit)? = null
@@ -98,6 +116,10 @@ class CameraPreviewView @JvmOverloads constructor(
      */
     private var imageWidth: Int = 0
     private var imageHeight: Int = 0
+
+    private val converter by lazy {
+        YuvToRgbConverter(context)
+    }
 
     // 自动拍照功能开关
     var isAutoCaptureEnabled: Boolean = false
@@ -130,6 +152,7 @@ class CameraPreviewView @JvmOverloads constructor(
         addView(previewView)
         addView(cropSelectionView)
         addView(gridLinesView)
+        addView(cropPreviewView)
     }
 
     /**
@@ -190,56 +213,23 @@ class CameraPreviewView @JvmOverloads constructor(
     }
 
     /**
-     * 设置分辨率
-     */
-    fun setResolution(size: Size): Boolean {
-        if (_supportedResolutions.contains(size)) {
-            currentResolution = size
-            // 保存分辨率到本地
-            SPUtils.getInstance().put("ResolutionWidth", size.width)
-            SPUtils.getInstance().put("ResolutionHeight", size.height)
-            startCamera()
-            return true
-        }
-        return false
-    }
-
-    /**
-     * 获取当前分辨率
-     * 若未设置使用获取上次设置保存的分辨率，默认使用1080p分辨率
-     */
-    fun getCurrentResolution(): Size = currentResolution ?: Size(
-        SPUtils.getInstance().getInt("ResolutionWidth", 1920),
-        SPUtils.getInstance().getInt("ResolutionHeight", 1080)
-    )
-
-    /**
-     * 获取支持的分辨率列表
-     * 初始化完成前只提供当前/默认分辨率可选
-     */
-    fun getSupportedResolutions(): List<Size> =
-        _supportedResolutions.ifEmpty { listOf(getCurrentResolution()) }
-
-    /**
      * 绑定相机用例
      */
     private fun bindCameraUseCases() {
-        val resolution = getCurrentResolution()
-
         // 配置预览用例
         preview = Preview.Builder()
-            .setTargetResolution(resolution)
             .build()
             .also { it.surfaceProvider = previewView.surfaceProvider }
         // 配置图像分析用例
         imageAnalyzer = ImageAnalysis.Builder()
-            .setTargetResolution(resolution)
+            .apply {
+//                configureCamera2Interop(this)
+            }
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
             .also {
-                it.setAnalyzer(
-                    Executors.newSingleThreadExecutor().also { cameraExecutor = it },
-                    DocumentAnalyzer { processDetectionResult(it) })
+                it.setAnalyzer(cameraExecutor, DocumentAnalyzer { processDetectionResult(it) })
             }
         // 选择后置摄像头
         val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
@@ -255,14 +245,6 @@ class CameraPreviewView @JvmOverloads constructor(
             )?.let { camera ->
                 // 初始化相机配置
                 isFlashAvailable = camera.cameraInfo.hasFlashUnit()
-                Camera2CameraInfo.from(camera.cameraInfo)
-                    .getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                    ?.getOutputSizes(ImageFormat.JPEG)
-                    ?.toList()
-                    ?.let {
-                        _supportedResolutions.clear()
-                        _supportedResolutions.addAll(it)
-                    }
             }
         } catch (exc: Exception) {
             LogUtils.e("CameraPreviewView", "相机绑定失败: ${exc.message}", exc)
@@ -343,14 +325,13 @@ class CameraPreviewView @JvmOverloads constructor(
      */
     private fun stopCamera() {
         cameraProvider?.unbindAll()
-        cameraExecutor?.shutdown()
+        cameraExecutor.shutdown()
         try {
-            cameraExecutor?.awaitTermination(1, TimeUnit.SECONDS)
+            cameraExecutor.awaitTermination(1, TimeUnit.SECONDS)
         } catch (e: InterruptedException) {
             e.printStackTrace()
             Thread.currentThread().interrupt()
         }
-        cameraExecutor = null
         cameraProvider = null
     }
 
@@ -422,27 +403,12 @@ class CameraPreviewView @JvmOverloads constructor(
     private fun updateCropSelectionView(points: List<Point>) {
         // 根据图片方向调整坐标
         if (points.size >= 8) {
-            // 计算缩放因子
-            val scaleX = width.toFloat() / imageWidth
-            val scaleY = height.toFloat() / imageHeight
-            val scale = min(scaleX, scaleY)
-
-            // 计算偏移量（居中显示）
-            val offsetX = (width.toFloat() - imageWidth * scale) / 2
-            val offsetY = (height.toFloat() - imageHeight * scale) / 2
-
             // 缩放并偏移坐标点
             val vertices = points.subList(0, 4).map {
-                CropSelectionView.Point(
-                    it.x.toFloat() * scale + offsetX,
-                    it.y.toFloat() * scale + offsetY
-                )
+                CropSelectionView.Point(it.x.toFloat(), it.y.toFloat())
             }
             val curvePoints = points.subList(4, 8).map {
-                CropSelectionView.Point(
-                    it.x.toFloat() * scale + offsetX,
-                    it.y.toFloat() * scale + offsetY
-                )
+                CropSelectionView.Point(it.x.toFloat(), it.y.toFloat())
             }
             cropSelectionView.setVertices(vertices)
             cropSelectionView.setCurvePoints(curvePoints)
@@ -465,6 +431,17 @@ class CameraPreviewView @JvmOverloads constructor(
         }
     }
 
+    private suspend fun showTestPreView(bitmap: Bitmap) {
+        withContext(Dispatchers.Main) {
+            if (System.currentTimeMillis() - (cropPreviewView.tag as Long) >= 3000L) {
+                cropPreviewView.visibility = VISIBLE
+                if (bitmap.isRecycled) return@withContext
+                cropPreviewView.setImageBitmap(bitmap)
+                cropPreviewView.tag = System.currentTimeMillis()
+            }
+        }
+    }
+
     /**
      * 处理分析图像类
      * 分析图像中文档框，并将文档点回调绘制到裁剪view
@@ -472,48 +449,26 @@ class CameraPreviewView @JvmOverloads constructor(
     private inner class DocumentAnalyzer(private val onDetected: (List<Point>?) -> Unit) :
         ImageAnalysis.Analyzer {
         @OptIn(ExperimentalGetImage::class)
-        override fun analyze(image: ImageProxy) {
-            imageWidth = image.width
-            imageHeight = image.height
-            val mediaImage = image.image ?: run {
-                image.close()
+        override fun analyze(imageProxy: ImageProxy) {
+            if (!isAutoCaptureEnabled) {
+                cropPreviewView.visibility = GONE
+                imageProxy.close()
                 return
             }
-
-            // 将YUV图像转换为Bitmap
-            // 将YUV_420_888图像转换为Bitmap
-            val yBuffer = mediaImage.planes[0].buffer
-            val uBuffer = mediaImage.planes[1].buffer
-            val vBuffer = mediaImage.planes[2].buffer
-
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            yBuffer.get(nv21, 0, ySize)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-
-            val yuvImage =
-                YuvImage(nv21, ImageFormat.NV21, mediaImage.width, mediaImage.height, null)
-            val outputStream = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(
-                Rect(0, 0, mediaImage.width, mediaImage.height),
-                100,
-                outputStream
-            )
-            val bitmap =
-                BitmapFactory.decodeByteArray(outputStream.toByteArray(), 0, outputStream.size())
-
+            imageWidth = imageProxy.width
+            imageHeight = imageProxy.height
+            val image = imageProxy.image ?: run {
+                imageProxy.close()
+                return
+            }
+            val bitmap = createBitmap(imageWidth, imageHeight, Bitmap.Config.ARGB_8888)
+            converter.yuvToRgb(image, bitmap)
             // 转换为OpenCV Mat
             val mat = Mat()
             Utils.bitmapToMat(bitmap, mat)
 
             // 检测文档边缘
-            val points = runCatching {
-                DocumentEdgeDetector.detectDocumentEdges(mat)
-            }.getOrNull()
+            val points = DocumentEdgeDetector.detectDocumentEdges(mat)
 
             // 回调检测结果
             onDetected(points)
@@ -521,42 +476,8 @@ class CameraPreviewView @JvmOverloads constructor(
             // 释放资源
             mat.release()
             bitmap.recycle()
+            imageProxy.close()
             image.close()
-        }
-    }
-
-    /**
-     * 网格线绘制视图
-     */
-    private inner class GridLinesView(context: Context) : View(context) {
-        private val paint = Paint().apply {
-            color = Color.argb(100, 255, 255, 255)
-            strokeWidth = 2f
-            style = Paint.Style.STROKE
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            drawGridLines(canvas)
-        }
-
-        private fun drawGridLines(canvas: Canvas) {
-            val horizontalLines = 2
-            val verticalLines = 2
-            val cellWidth = width.toFloat() / (verticalLines + 1)
-            val cellHeight = height.toFloat() / (horizontalLines + 1)
-
-            // 绘制水平线
-            for (i in 1..horizontalLines) {
-                val y = cellHeight * i
-                canvas.drawLine(0f, y, width.toFloat(), y, paint)
-            }
-
-            // 绘制垂直线
-            for (i in 1..verticalLines) {
-                val x = cellWidth * i
-                canvas.drawLine(x, 0f, x, height.toFloat(), paint)
-            }
         }
     }
 }

@@ -41,6 +41,7 @@
             </intent-filter>
         </activity>
         <activity android:name=".ui.activity.TakePhotoActivity" android:screenOrientation="portrait"/>
+        <activity android:name=".ui.activity.TestCameraActivity" android:screenOrientation="portrait"/>
     </application>
 
 </manifest>

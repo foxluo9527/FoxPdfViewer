@@ -3,6 +3,8 @@ package com.foxluo.pdf.util
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
 import android.util.Log
+import androidx.core.graphics.createBitmap
+import org.opencv.android.Utils
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -13,12 +15,6 @@ import kotlin.math.sqrt
  * 支持检测平铺和非平铺文档，返回顶点和弯曲点坐标
  *
  * @property TAG 日志标签
- * @property DEFAULT_HOUGH_THRESHOLD HoughLinesP默认阈值
- * @property MIN_LINE_LENGTH 最小线段长度
- * @property MAX_LINE_GAP 最大线段间隙
- * @property HORIZONTAL_ANGLE_TOLERANCE 水平线角度容差(度)
- * @property VERTICAL_ANGLE_LOW 垂直线角度下限(度)
- * @property VERTICAL_ANGLE_HIGH 垂直线角度上限(度)
  */
 object DocumentEdgeDetector {
     private const val TAG = "DocumentEdgeDetector"
@@ -29,20 +25,19 @@ object DocumentEdgeDetector {
      * @return 包含8个坐标点的列表，前4个为顶点，后4个为弯曲点
      * @throws IllegalArgumentException 如果输入Mat为空或无效
      */
-    fun detectDocumentEdges(srcMat: Mat): List<Point> {
+    fun detectDocumentEdges(srcMat: Mat): List<Point>? {
         require(!srcMat.empty()) { "输入图像Mat不能为空" }
 //        require(srcMat.type() == CvType.CV_8UC3) { "输入图像必须是BGR格式的8位3通道图像" }
         // 1. 图像预处理
         val processedMat = preprocessImage(srcMat)
-
         // 2. 边缘检测
         val edgesMat = detectEdges(processedMat)
-
         // 3. 轮廓检测与顶点提取
         val vertices = try {
             detectContours(edgesMat)
         } catch (e: IllegalArgumentException) {
-            throw Exception("轮廓检测失败: ${e.message}")
+            Log.d(TAG, "轮廓检测失败: ${e.message}")
+            return null
         }
         Log.d(TAG, "检测到四边形顶点: ${vertices.size}个")
 
@@ -57,24 +52,31 @@ object DocumentEdgeDetector {
      * 图像预处理：灰度转换、高斯模糊
      */
     private fun preprocessImage(srcMat: Mat): Mat {
-        // 转换为灰度图
-        val grayMat = Mat()
-        Imgproc.cvtColor(srcMat, grayMat, Imgproc.COLOR_BGR2GRAY)
+        // 调整图像大小以减少内存占用
+        val resizedMat = Mat()
+        val maxDimension = 500.0
+        val scale = maxDimension / max(srcMat.width(), srcMat.height())
+        if (scale < 1.0) {
+            Imgproc.resize(srcMat, resizedMat, Size(0.0, 0.0), scale, scale, Imgproc.INTER_AREA)
+        } else {
+            srcMat.copyTo(resizedMat)
+        }
 
-        // 高斯模糊去除干扰
+        val grayMat = Mat()
+        Imgproc.cvtColor(resizedMat, grayMat, Imgproc.COLOR_BGR2GRAY)
+        resizedMat.release() // 释放调整大小后的图像
+
+        // 高斯模糊去除干扰 - 使用较小的核并降低 sigma 值
         val blurredMat = Mat()
-        Imgproc.GaussianBlur(grayMat, blurredMat, Size(5.0, 5.0), 0.0)
+        Imgproc.GaussianBlur(grayMat, blurredMat, Size(3.0, 3.0), 1.0)
+        grayMat.release() // 释放灰度图像
 
         // 添加Otsu阈值处理增强对比度
         val thresholdMat = Mat()
         Imgproc.threshold(blurredMat, thresholdMat, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
-
-        // 释放中间Mat
-        grayMat.release()
-        blurredMat.release()
+        blurredMat.release() // 释放模糊图像
 
         return thresholdMat
-
     }
 
     /**
@@ -84,11 +86,9 @@ object DocumentEdgeDetector {
         // Canny边缘检测
         val edgesMat = Mat()
         // 降低阈值以检测更多边缘
-        Imgproc.Canny(processedMat, edgesMat, 30.0, 90.0, 3)
+        Imgproc.Canny(processedMat, edgesMat, 60.0, 240.0, 3)
 
         // 膨胀操作，连接边缘
-        // 减少膨胀迭代次数，避免过度膨胀导致轮廓变形
-        // 增加膨胀迭代次数以增强边缘连接
         // 增强膨胀操作以连接更多边缘
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
         Imgproc.dilate(edgesMat, edgesMat, kernel, Point(-1.0, -1.0), 3, 1, Scalar(1.0))
@@ -133,8 +133,9 @@ object DocumentEdgeDetector {
             // 调整近似系数，平衡细节与稳定性
             val epsilon = 0.05 * perimeter
             Imgproc.approxPolyDP(MatOfPoint2f(*contour.toArray()), approx, epsilon, true)
-            if (approx.toArray().size == 4) {
+            if (approx.toArray().size >= 4) {
                 maxContour = contour
+                bestApprox = MatOfPoint2f(approx.clone())
                 approx.release()
                 break
             }
@@ -159,7 +160,6 @@ object DocumentEdgeDetector {
         hierarchy.release()
         maxContour.release()
 
-        // 验证四边形的宽高比（避免过窄或过宽的形状）
         // 检查是否为四边形并验证形状合理性
         if (adjustedVertices.size != 4) {
             throw IllegalArgumentException("检测到的轮廓不是四边形，顶点数量: ${adjustedVertices.size}")
@@ -376,8 +376,7 @@ object DocumentEdgeDetector {
         }
 
         // 结合顶点和弯曲点优化源点坐标
-        val optimizedVertices = vertices.zip(curvePoints) {
-            vertex, curve ->
+        val optimizedVertices = vertices.zip(curvePoints) { vertex, curve ->
             Point(
                 (vertex.x * 0.7 + curve.x * 0.3),
                 (vertex.y * 0.7 + curve.y * 0.3)
